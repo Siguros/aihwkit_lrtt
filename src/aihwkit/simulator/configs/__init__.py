@@ -2,7 +2,13 @@
 
 # (C) Copyright 2020, 2021, 2022, 2023, 2024 IBM. All Rights Reserved.
 #
-# Licensed under the MIT license. See LICENSE file in the project root for details.
+# This code is licensed under the Apache License, Version 2.0. You may
+# obtain a copy of this license in the LICENSE.txt file in the root directory
+# of this source tree or at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# Any modifications or derivative works of this code must retain this
+# copyright notice, and modified files need to carry a notice indicating
+# that they have been altered from the originals.
 
 """Configurations for resistive processing units."""
 
@@ -56,6 +62,16 @@ from .compounds import (
     DynamicTransferCompound,
     MixedPrecisionCompound,
 )
+from .lrtt_python import PythonLRTTDevice
+from .lrtt_rpu_config import PythonLRTTRPUConfig  
+from .lrtt_config import (
+    lrtt_idealized_config,
+    lrtt_constant_step_config,
+    lrtt_lora_style_config,
+    lrtt_mixed_precision_config,
+    lrtt_inference_config,
+    migrate_from_legacy_lrtt_compound,
+)
 from .configs import (
     FloatingPointRPUConfig,
     InferenceRPUConfig,
@@ -64,23 +80,6 @@ from .configs import (
     DigitalRankUpdateRPUConfig,
     TorchInferenceRPUConfig,
     TorchInferenceRPUConfigIRDropT,
-    QuantizedTorchInferenceRPUConfig,
 )
 
 from .helpers import build_config
-
-# Python-level LRTT configurations
-from .lrtt_config import (
-    PythonLRTTRPUConfig,
-    lrtt_idealized_config,
-    lrtt_constant_step_config,
-    lrtt_lora_style_config,
-    lrtt_mixed_precision_config,
-    lrtt_inference_config,
-    migrate_from_legacy_lrtt_compound,
-)
-
-from .lrtt_python import (
-    PythonLRTTDevice,
-    PythonLRTTPreset,
-)

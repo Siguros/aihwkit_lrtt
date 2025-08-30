@@ -120,14 +120,20 @@ class LRTTController:
         self.dtype = self._get_tile_dtype()
         
     def _get_tile_device(self) -> torch.device:
-        """Get common device from tiles.""" 
-        # Check if tile is a CUDA tile by looking at its class name
+        """Get device that tiles expect for operations."""
+        # Check if underlying tile is CUDA (even if weights stored on CPU)
         if hasattr(self.tile_c, 'tile'):
-            tile_str = str(self.tile_c.tile)
-            if 'RPUCuda' in tile_str or 'CUDA' in tile_str:
+            tile_str = str(type(self.tile_c.tile).__name__)
+            if 'Cuda' in tile_str or 'CUDA' in tile_str:
                 return torch.device('cuda')
-        # Default to CUDA if available
-        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Fallback: check weight device
+        try:
+            C_weights = self.tile_c.get_weights()[0]
+            return C_weights.device
+        except:
+            # Default to CPU
+            return torch.device('cpu')
         
     def _get_tile_dtype(self) -> torch.dtype:
         """Get common dtype from tiles."""
@@ -200,124 +206,62 @@ class LRTTController:
         
     def ab_weight_update(
         self, 
-        x: Tensor,     # [x_size, m] or [m, x_size] depending on layout
-        d: Tensor,     # [d_size, m] or [m, d_size] depending on layout  
+        x: Tensor,
+        d: Tensor,
         lr: float,
         in_trans: bool = False,
         out_trans: bool = False
     ) -> None:
-        """LoRA-style pulsed A/B update with rank projections.
+        """Update A and B with LoRA-style rank-r gradient approximation.
         
-        Given x ∈ ℝ^{x_size×m}, d ∈ ℝ^{d_size×m}:
-        1. Pack A_lr = A[:, :rank], B_lr = B[:rank, :]  
-        2. Compute projections: X_B = B_lr @ x, D_A = A_lr^T @ d
-        3. Route to tiles with proper rank-constrained updates:
-           - A update: inputs = X_B, errors = d
-           - B update: only update first rank rows with gradient from D_A
-        4. Apply BL management and gradient magnitude correction
+        Simplified batch-first processing with no intermediate transposes.
+        Uses tile forward/backward for projections and tile update for weight changes.
         
         Args:
-            x: Input tensor [x_size, m] (or transposed)
-            d: Error tensor [d_size, m] (or transposed)  
+            x: Input tensor
+            d: Error tensor
             lr: Learning rate
-            in_trans: Input transposed flag
-            out_trans: Output transposed flag
+            in_trans: Whether x is transposed
+            out_trans: Whether d is transposed
         """
-        # Tiles expect [batch, features] but we need [features, batch] for matrix ops
-        # Input is [batch, features], transpose to [features, batch]
-        if x.dim() == 2:
-            if x.size(1) == self.x_size:  # [batch, x_size]
-                x = x.t()  # -> [x_size, batch]
-        if d.dim() == 2:
-            if d.size(1) == self.d_size:  # [batch, d_size]
-                d = d.t()  # -> [d_size, batch]
-                
-        # Handle transpose flags
+        # 0) Normalize to [batch, feat] format
         if in_trans:
-            x = x.t()  
+            x = x.t()
         if out_trans:
             d = d.t()
-            
-        batch_size = x.size(-1)
-        self._ensure_buffers(batch_size)
         
-        # Prepare batch-first views for tile operations
-        x_bf = x.t()  # [batch, x_size]
-        d_bf = d.t()  # [batch, d_size]
-        
-        # Compute LoRA projections using tile forward/backward (no get_weights!)
+        # 1) Projections (analog path)
         with torch.no_grad():
-            # X_B = B_lr @ x -> Use B tile forward (B is now [rank, x_size])
-            X_B = self.tile_b.forward(x_bf).t()  # [batch, rank] -> [rank, batch]
-            
-            # D_A = A_lr^T @ d -> Use A tile backward if available
-            if hasattr(self.tile_a, 'backward'):
-                # A.backward gives gradient w.r.t. input: [batch, rank]
-                D_A = self.tile_a.backward(d_bf).t()  # [rank, batch]
-            else:
-                # Fallback: read weights (only if backward not available)
-                A_full = self.tile_a.get_weights()[0].to(x.device)  # [d_size, rank]
-                D_A = A_full[:, :self.rank].t() @ d  # [rank, d_size] @ [d_size, batch] -> [rank, batch]
+            XB = self.tile_b.forward(x)     # [batch, rank] = B·X
+            DA = self.tile_a.backward(d)    # [batch, rank] = A^T·D
         
-        # Apply LoRA alpha scaling and gradient magnitude correction
-        # Critical: LoRA gradients need to be scaled by alpha
+        # 2) lr_eff = lr * α * (1/√r, optional)
         lr_eff = lr * self.lora_alpha
-        
-        # Apply gradient magnitude correction (optional)
         if self.correct_gradient_magnitudes:
-            # Use 1/sqrt(rank) for proper scaling (not sqrt(rank))
-            lr_eff = lr_eff / math.sqrt(self.rank)
-            
-        # Update A tile: inputs = X_B, errors = d
-        # A tile is [d_size, rank] and expects inputs [batch, rank]
-        # NOTE: In CUDA, X_B is padded to [x_size, batch] but for Python tiles
-        # we use X_B directly as [batch, rank] since tiles handle dimensions differently
+            lr_eff /= math.sqrt(self.rank)
         
-        # Apply BL management for A update
-        old_lr = self.tile_a.get_learning_rate() 
+        # 3) ΔA = -lr_eff · D^T · (B·X) → tile_a.update(XB, d)
+        lr_a_old = self.tile_a.get_learning_rate()
         self.tile_a.set_learning_rate(lr_eff)
-        
-        # Force StochasticCompressed pulse type if BL management specified
-        if self.ab_bl_mgmt:
-            # Apply ab_bl_mgmt settings - simplified for now
-            pass
-            
-        # Tiles expect [batch, features] format
-        # X_B is [rank, batch], transpose to [batch, rank]
-        # d is [d_size, batch], transpose to [batch, d_size]
-        # Use original update if available (to avoid hook recursion)
         if hasattr(self.tile_a, '_orig_update'):
-            self.tile_a._orig_update(X_B.t(), d.t())
+            self.tile_a._orig_update(XB, d)
         else:
-            self.tile_a.update(X_B.t(), d.t())
-        self.tile_a.set_learning_rate(old_lr)
+            self.tile_a.update(XB, d)
+        self.tile_a.set_learning_rate(lr_a_old)
         self.num_a_updates += 1
         
-        # Update B tile: inputs = x, errors = D_A 
-        # B tile is now [rank, x_size], so no padding needed
-        
-        old_lr_b = self.tile_b.get_learning_rate()
+        # 4) ΔB = -lr_eff · (A^T·D)^T · X → tile_b.update(x, DA)
+        lr_b_old = self.tile_b.get_learning_rate()
         self.tile_b.set_learning_rate(lr_eff)
-        
-        if self.ab_bl_mgmt:
-            # Apply ab_bl_mgmt settings
-            pass
-            
-        # Tiles expect [batch, features] format
-        # B tile is [rank, x_size], expects inputs [batch, x_size] and errors [batch, rank]
-        # Use original update if available (to avoid hook recursion)
         if hasattr(self.tile_b, '_orig_update'):
-            self.tile_b._orig_update(x.t(), D_A.t())  # x.t() = [batch, x_size], D_A.t() = [batch, rank]
+            self.tile_b._orig_update(x, DA)
         else:
-            self.tile_b.update(x.t(), D_A.t())
-        self.tile_b.set_learning_rate(old_lr_b)
+            self.tile_b.update(x, DA)
+        self.tile_b.set_learning_rate(lr_b_old)
         self.num_b_updates += 1
         
-        # Update counters
-        if self.units_in_mbatch:
-            self.transfer_counter += batch_size
-        else:
-            self.transfer_counter += 1
+        # 5) Counter
+        self.transfer_counter += (x.shape[0] if self.units_in_mbatch else 1)
             
     def ab_weight_transfer(self) -> None:
         """Pulsed A⊗B -> visible transfer, then reinit.
@@ -367,14 +311,15 @@ class LRTTController:
             # Pulsed update: C += transfer_lr * D_chunk @ X_chunk  
             # Use original update to avoid hook recursion
             # Tiles expect [batch, features] format: X_chunk is [cur, x_size], D_chunk.T is [cur, d_size]
-            # Ensure tensors are on CPU for analog tiles
-            X_chunk_cpu = X_chunk.cpu() if X_chunk.is_cuda else X_chunk
-            D_chunk_t_cpu = D_chunk.t().cpu() if D_chunk.is_cuda else D_chunk.t()
+            # Keep tensors on same device as tiles
+            device = self._get_tile_device()
+            X_chunk_device = X_chunk.to(device)
+            D_chunk_t_device = D_chunk.t().to(device)
             
             if hasattr(self.tile_c, '_orig_update'):
-                self.tile_c._orig_update(X_chunk_cpu, D_chunk_t_cpu)
+                self.tile_c._orig_update(X_chunk_device, D_chunk_t_device)
             else:
-                self.tile_c.update(X_chunk_cpu, D_chunk_t_cpu)
+                self.tile_c.update(X_chunk_device, D_chunk_t_device)
             
         self.tile_c.set_learning_rate(old_lr)
         self.num_transfers += 1
@@ -410,12 +355,8 @@ class LRTTController:
         if not self.forward_inject_enabled or self.rank == 0:
             return self.tile_c.forward(x, in_trans=in_trans, out_trans=out_trans)
             
-        # Handle transposed cases with digital fallback
-        if out_trans or in_trans:
-            return self._forward_inject_digital_fallback(x, out_trans, in_trans)
-            
-        # Default analog-hybrid path
-        return self._forward_inject_analog_hybrid(x)
+        # Use unified analog path for all cases (including transpose)
+        return self._forward_inject_analog_unified(x, in_trans=in_trans, out_trans=out_trans)
         
     def _forward_inject_digital_fallback(
         self, 
@@ -445,27 +386,54 @@ class LRTTController:
         return result
         
     def _forward_inject_analog_hybrid(self, x: Tensor) -> Tensor:
-        """Analog-hybrid path: y_vis = C·x, g = B·x[:rank], y_ab = A·g, combine."""
-        # Note: AnalogTile expects [batch, features] format (batch-first)
-        # No transposition needed
-            
-        # 1. Visible forward: y_vis = C·x
-        y_vis = self.tile_c.forward(x)  # [batch, d_size]
+        """Analog-hybrid path using direct weight computation (deterministic).
         
-        # 2. B forward: g = B·x  
-        g_rank = self.tile_b.forward(x)  # [batch, rank] since B is [rank, x_size]
+        Replaces non-deterministic tile forward operations with direct matrix computation:
+        y = x @ (C^T + α * B^T @ A^T)
         
-        # 3. A forward with g_rank directly
-        # A tile is [d_size, rank] internally (only uses first rank cols)
-        # It expects input [batch, rank] which is exactly what g_rank is
+        This ensures consistent forward pass behavior for training stability.
+        """
+        # Get component weights directly
+        C_weights = self.tile_c.get_weights()[0]  # [d_size, x_size]
+        A_weights = self.tile_a.get_weights()[0][:, :self.rank]  # [d_size, rank] 
+        B_weights = self.tile_b.get_weights()[0][:self.rank, :]  # [rank, x_size]
         
-        # 4. A forward: y_ab = A·g_rank
-        y_ab = self.tile_a.forward(g_rank)  # [batch, d_size]
+        # Compute effective weight matrix: W_eff = C^T + α * B^T @ A^T
+        W_eff = C_weights.t() + self.lora_alpha * (B_weights.t() @ A_weights.t())
         
-        # 5. Digital combination: y = y_vis + α * y_ab
-        result = y_vis + self.lora_alpha * y_ab  # [batch, d_size]
+        # Ensure same device as input
+        W_eff = W_eff.to(x.device)
+        
+        # Forward pass: y = x @ W_eff
+        result = x @ W_eff  # [batch, x_size] @ [x_size, d_size] = [batch, d_size]
         
         return result
+        
+    def _forward_inject_analog_unified(
+        self, 
+        x: Tensor, 
+        in_trans: bool, 
+        out_trans: bool
+    ) -> Tensor:
+        """Unified analog path using proper tile forward operations.
+        
+        Uses analog tile forward operations in the correct B→A→C order.
+        This ensures analog read constraints (noise/clipping) are applied
+        and AnalogSGD's input/error caches work correctly.
+        """
+        # 1) Normalize input to batch-first
+        x_bf = x.t() if in_trans else x  # [batch, x_size]
+        
+        # 2) Analog read order guaranteed: B → A → C
+        g = self.tile_b.forward(x_bf)      # [batch, rank]
+        y_ab = self.tile_a.forward(g)      # [batch, d_size]
+        y_c = self.tile_c.forward(x_bf)    # [batch, d_size]
+        
+        # 3) Composition
+        y = y_c + self.lora_alpha * y_ab   # [batch, d_size]
+        
+        # 4) Output transpose
+        return y.t() if out_trans else y
         
     def should_transfer(self) -> bool:
         """Check if transfer should occur based on counter and schedule."""

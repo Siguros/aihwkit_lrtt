@@ -82,7 +82,7 @@ class LRTTSimulatorTile(SimulatorTile, Module):
         self.lora_alpha = getattr(self.lrtt_config, 'lora_alpha', 1.0)
         self.reinit_gain = getattr(self.lrtt_config, 'reinit_gain', 0.1)
         self.correct_gradient_magnitudes = getattr(self.lrtt_config, 'correct_gradient_magnitudes', False)
-        self.forward_inject = getattr(self.lrtt_config, 'forward_inject', True)
+        # Note: forward_inject flag is managed by the controller only
         self.rank_chunk = getattr(self.lrtt_config, 'rank_chunk', None)
         
         # Create individual tiles using unit cell devices
@@ -137,7 +137,7 @@ class LRTTSimulatorTile(SimulatorTile, Module):
             reinit_gain=self.reinit_gain,
             correct_gradient_magnitudes=self.correct_gradient_magnitudes,
             rank_chunk=self.rank_chunk,
-            forward_inject=self.forward_inject
+            forward_inject=getattr(self.lrtt_config, 'forward_inject', True)
         )
         
         # Initialize LRTT weights
@@ -227,13 +227,16 @@ class LRTTSimulatorTile(SimulatorTile, Module):
         if bias:
             raise TileError("LRTT does not support bias")
             
-        # CRITICAL FIX: Always use forward_inject when enabled (training AND inference)
-        # This matches CUDA behavior where forward_inject is applied consistently
-        if self.forward_inject:
+        # Single source of truth: Use controller's forward_inject_enabled flag only
+        # This avoids confusion from multiple forward_inject flags
+        if self.controller.forward_inject_enabled:
             return self.controller.forward_inject(x_input, out_trans=out_trans, in_trans=in_trans)
         else:
             # Fallback to visible-only forward when disabled
-            return self.tile_c.forward(x_input, bias, in_trans, out_trans, is_test, non_blocking)
+            # Handle transpose manually since AnalogTile doesn't support transpose flags
+            x = x_input.t() if in_trans else x_input
+            y = self.tile_c.forward(x)
+            return y.t() if out_trans else y
     
     def backward(
         self,
@@ -243,54 +246,27 @@ class LRTTSimulatorTile(SimulatorTile, Module):
         out_trans: bool = False,
         non_blocking: bool = False,
     ) -> Tensor:
-        """Backward pass with proper gradient composition.
+        """LRTT backward pass using only analog tile operations.
         
-        When forward_inject is enabled, computes:
-        x_grad = C^T @ d + α * B^T @ (A^T @ d)
-        
-        This matches CUDA semantics for consistent gradient flow.
+        Computes: x_grad = C^T @ d + α * B^T @ (A^T @ d)
+        All operations use tile.backward() to ensure proper analog constraints.
         """
         if bias:
             raise TileError("LRTT does not support bias")
             
-        # If forward injection is disabled, use simple backward
-        if not self.forward_inject:
-            d_for_tile = d_input
-            if in_trans:
-                d_for_tile = d_for_tile.t()
-            x_grad = self.tile_c.backward(d_for_tile)
-            if out_trans:
-                x_grad = x_grad.t()
-            return x_grad
-            
-        # CRITICAL: Compose x-gradient to match forward injection
-        # x_grad = C^T @ d + α * B^T @ (A^T @ d)
+        # 1) Input to batch-first
+        d_bf = d_input.t() if in_trans else d_input  # [batch, d_size]
         
-        # Handle transpose if needed
-        d_for_tiles = d_input
-        if in_trans:
-            d_for_tiles = d_for_tiles.t()
+        # 2) C^T·d, A^T·d, B^T·(A^T·d) — all using tile backward
+        xg_c = self.tile_c.backward(d_bf)   # [batch, x_size]
+        da = self.tile_a.backward(d_bf)     # [batch, rank]
+        xg_ab = self.tile_b.backward(da)    # [batch, x_size]
         
-        # 1. Visible backward: x_grad_vis = C^T @ d
-        x_grad_vis = self.tile_c.backward(d_for_tiles)
+        # 3) Composition
+        x_grad = xg_c + self.lora_alpha * xg_ab
         
-        # 2. A^T @ d through A tile backward
-        # A is [d_size, rank], so A.backward returns [batch, rank] gradient w.r.t. input
-        at_d = self.tile_a.backward(d_for_tiles)
-        
-        # 3. B^T @ (A^T @ d) through B tile backward  
-        # B is [rank, x_size], so B.backward expects [batch, rank] and returns [batch, x_size]
-        # No padding needed! at_d is already [batch, rank] which is exactly what B.backward expects
-        x_grad_ab = self.tile_b.backward(at_d)
-        
-        # 4. Combine: x_grad = x_grad_vis + α * x_grad_ab
-        x_grad = x_grad_vis + self.lora_alpha * x_grad_ab
-        
-        # Handle output transpose if needed
-        if out_trans:
-            x_grad = x_grad.t()
-            
-        return x_grad
+        # 4) Output transpose
+        return x_grad.t() if out_trans else x_grad
     
     def update(
         self,

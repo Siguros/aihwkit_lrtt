@@ -186,9 +186,9 @@ class PythonLRTTPreset(_PrintableMixin):
         Returns:
             Idealized PythonLRTTDevice configuration
         """
-        from aihwkit.simulator.configs.devices import IdealDevice
+        from aihwkit.simulator.presets.devices import IdealizedPresetDevice
         
-        ideal_device = IdealDevice()
+        ideal_device = IdealizedPresetDevice()
         
         return PythonLRTTDevice(
             rank=rank,
@@ -242,7 +242,7 @@ class PythonLRTTPreset(_PrintableMixin):
         Returns:
             LoRA-style PythonLRTTDevice configuration
         """
-        from aihwkit.simulator.configs.devices import IdealDevice
+        from aihwkit.simulator.presets.devices import IdealizedPresetDevice
         
         return PythonLRTTDevice(
             rank=rank,
@@ -251,7 +251,7 @@ class PythonLRTTPreset(_PrintableMixin):
             reinit_gain=0.05,  # Smaller reinit for frequent transfers
             forward_inject=True,
             correct_gradient_magnitudes=True,  # Better scaling for higher ranks
-            unit_cell_devices=[IdealDevice(), IdealDevice(), IdealDevice()]
+            unit_cell_devices=[IdealizedPresetDevice(), IdealizedPresetDevice(), IdealizedPresetDevice()]
         )
     
     @staticmethod
@@ -291,7 +291,7 @@ class PythonLRTTPreset(_PrintableMixin):
         Returns:
             Inference-optimized PythonLRTTDevice configuration
         """
-        from aihwkit.simulator.configs.devices import IdealDevice
+        from aihwkit.simulator.presets.devices import IdealizedPresetDevice
         
         return PythonLRTTDevice(
             rank=rank,
@@ -300,5 +300,5 @@ class PythonLRTTPreset(_PrintableMixin):
             reinit_gain=0.0,  # No reinit needed for inference
             forward_inject=True,  # Essential for inference
             columns_mode=True,  # Optimized mode
-            unit_cell_devices=[IdealDevice(), IdealDevice(), IdealDevice()]
+            unit_cell_devices=[IdealizedPresetDevice(), IdealizedPresetDevice(), IdealizedPresetDevice()]
         )
