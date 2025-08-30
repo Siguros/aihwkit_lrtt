@@ -102,7 +102,7 @@ class LRTTSimulatorTile(SimulatorTile, Module):
         )
         self.tile_a = rpu_config_a.tile_class(d_size, self.rank, rpu_config_a)
         
-        # Tile B: fastB [d_size, x_size] (full size for easy indexing, only first rank rows used)
+        # Tile B: fastB [rank, x_size] (only rank rows needed for LoRA)
         rpu_config_b = SingleRPUConfig(
             device=unit_devices[1], 
             forward=rpu_config.forward,
@@ -110,7 +110,7 @@ class LRTTSimulatorTile(SimulatorTile, Module):
             update=rpu_config.update,
             tile_class=AnalogTile
         )
-        self.tile_b = rpu_config_b.tile_class(d_size, x_size, rpu_config_b)
+        self.tile_b = rpu_config_b.tile_class(self.rank, x_size, rpu_config_b)
         
         # Tile C: visible [d_size, x_size]  
         rpu_config_c = SingleRPUConfig(
@@ -143,6 +143,62 @@ class LRTTSimulatorTile(SimulatorTile, Module):
         # Initialize LRTT weights
         self.controller.reinit()
         
+        # Hook individual tile updates to route through controller
+        self._hook_tile_updates()
+        
+    def _hook_tile_updates(self) -> None:
+        """Hook individual tile update methods to route through controller.
+        
+        When AnalogSGD calls update on individual tiles, we intercept
+        and route through the controller for proper LRTT updates.
+        """
+        # Store original update methods
+        self.tile_a._orig_update = self.tile_a.update
+        self.tile_b._orig_update = self.tile_b.update
+        self.tile_c._orig_update = self.tile_c.update
+        
+        # Track if we've already handled this batch
+        self._update_handled = False
+        
+        def hooked_update(tile_name):
+            def update_wrapper(x_input, d_input, *args, **kwargs):
+                # Prevent double updates - only handle once per batch
+                if self._update_handled:
+                    return None
+                    
+                # Tile C gets the full inputs, use those for LRTT update
+                if tile_name == 'tile_c':
+                    self._update_handled = True  # Mark as handled
+                    
+                    # Get learning rate
+                    lr = self.tile_c.get_learning_rate()
+                    
+                    # Route through controller for proper LRTT update
+                    self.controller.ab_weight_update(
+                        x=x_input,  # This is the full [batch, x_size] input
+                        d=d_input,  # This is the full [batch, d_size] gradient
+                        lr=lr,
+                        in_trans=False,
+                        out_trans=False
+                    )
+                    
+                    # Check for transfer
+                    if self.controller.should_transfer():
+                        self.controller.ab_weight_transfer()
+                    
+                # Don't call original update on any tile - LRTT handles all updates
+                return None
+            return update_wrapper
+        
+        # Replace update methods
+        self.tile_a.update = hooked_update('tile_a')
+        self.tile_b.update = hooked_update('tile_b')
+        self.tile_c.update = hooked_update('tile_c')
+        
+    def _reset_update_flag(self) -> None:
+        """Reset the update handled flag for next batch."""
+        self._update_handled = False
+        
     def forward(
         self,
         x_input: Tensor,
@@ -165,12 +221,15 @@ class LRTTSimulatorTile(SimulatorTile, Module):
         Returns:
             Output tensor
         """
+        # Reset update flag for this forward pass
+        self._reset_update_flag()
+        
         if bias:
             raise TileError("LRTT does not support bias")
             
         # CRITICAL FIX: Always use forward_inject when enabled (training AND inference)
         # This matches CUDA behavior where forward_inject is applied consistently
-        if self.lrtt_config.forward_inject:
+        if self.forward_inject:
             return self.controller.forward_inject(x_input, out_trans=out_trans, in_trans=in_trans)
         else:
             # Fallback to visible-only forward when disabled
@@ -196,32 +255,41 @@ class LRTTSimulatorTile(SimulatorTile, Module):
             
         # If forward injection is disabled, use simple backward
         if not self.forward_inject:
-            return self.tile_c.backward(d_input, bias, in_trans, out_trans, non_blocking)
+            d_for_tile = d_input
+            if in_trans:
+                d_for_tile = d_for_tile.t()
+            x_grad = self.tile_c.backward(d_for_tile)
+            if out_trans:
+                x_grad = x_grad.t()
+            return x_grad
             
         # CRITICAL: Compose x-gradient to match forward injection
         # x_grad = C^T @ d + α * B^T @ (A^T @ d)
         
+        # Handle transpose if needed
+        d_for_tiles = d_input
+        if in_trans:
+            d_for_tiles = d_for_tiles.t()
+        
         # 1. Visible backward: x_grad_vis = C^T @ d
-        x_grad_vis = self.tile_c.backward(d_input, bias, in_trans, out_trans, non_blocking)
+        x_grad_vis = self.tile_c.backward(d_for_tiles)
         
-        # 2. A^T @ d through A tile backward (need to pad d to x_size for A backward)
-        # Since A is [d_size, x_size], its backward expects [d_size, batch] and returns [x_size, batch]
-        ATd = self.tile_a.backward(d_input, bias=False, in_trans=in_trans, out_trans=out_trans)
+        # 2. A^T @ d through A tile backward
+        # A is [d_size, rank], so A.backward returns [batch, rank] gradient w.r.t. input
+        at_d = self.tile_a.backward(d_for_tiles)
         
-        # 3. Take first rank elements of ATd (since only first rank columns of A are used)
-        ATd_rank = ATd[:self.rank, :]  # [rank, batch]
+        # 3. B^T @ (A^T @ d) through B tile backward  
+        # B is [rank, x_size], so B.backward expects [batch, rank] and returns [batch, x_size]
+        # No padding needed! at_d is already [batch, rank] which is exactly what B.backward expects
+        x_grad_ab = self.tile_b.backward(at_d)
         
-        # 4. B^T @ ATd_rank through B tile backward (need to pad ATd_rank to d_size)
-        batch_size = d_input.size(-1) if not out_trans else d_input.size(0)
-        d_pad = torch.zeros(self.d_size, batch_size, device=d_input.device, dtype=d_input.dtype)
-        d_pad[:self.rank, :] = ATd_rank
+        # 4. Combine: x_grad = x_grad_vis + α * x_grad_ab
+        x_grad = x_grad_vis + self.lora_alpha * x_grad_ab
         
-        # B backward: [x_size, batch] = B^T @ [d_size, batch]
-        BTATd = self.tile_b.backward(d_pad, bias=False, in_trans=False, out_trans=False)
-        
-        # 5. Combine: x_grad = x_grad_vis + α * BTATd
-        x_grad = x_grad_vis + self.lora_alpha * BTATd
-        
+        # Handle output transpose if needed
+        if out_trans:
+            x_grad = x_grad.t()
+            
         return x_grad
     
     def update(
@@ -246,6 +314,11 @@ class LRTTSimulatorTile(SimulatorTile, Module):
         if bias:
             raise TileError("LRTT does not support bias")
             
+        # Prevent double updates
+        if self._update_handled:
+            return None
+        self._update_handled = True
+        
         # Get current learning rate (assuming all tiles have same LR)
         lr = self.get_learning_rate()
         
@@ -285,8 +358,7 @@ class LRTTSimulatorTile(SimulatorTile, Module):
         # Get individual component weights
         visible_weights = self.tile_c.get_weights()[0]  # [d_size, x_size]
         A_weights = self.tile_a.get_weights()[0]        # [d_size, rank]
-        B_full = self.tile_b.get_weights()[0]           # [d_size, x_size]
-        B_weights = B_full[:self.rank, :]               # [rank, x_size]
+        B_weights = self.tile_b.get_weights()[0]        # [rank, x_size]
         
         # Compose effective weights
         W_eff = compose_lrtt_weights(
@@ -319,8 +391,7 @@ class LRTTSimulatorTile(SimulatorTile, Module):
         """
         visible_weights = self.tile_c.get_weights()[0]  # [d_size, x_size]
         A_weights = self.tile_a.get_weights()[0]        # [d_size, rank]
-        B_full = self.tile_b.get_weights()[0]           # [d_size, x_size]
-        B_lr = B_full[:self.rank, :]                    # [rank, x_size]
+        B_lr = self.tile_b.get_weights()[0]             # [rank, x_size]
         
         return visible_weights, A_weights, B_lr
         
@@ -343,10 +414,8 @@ class LRTTSimulatorTile(SimulatorTile, Module):
         # Set A weights
         self.tile_a.set_weights(A, None)
         
-        # Set B weights (expand to full size)
-        B_full = torch.zeros(self.d_size, self.x_size, device=B_lr.device, dtype=B_lr.dtype)
-        B_full[:self.rank, :] = B_lr
-        self.tile_b.set_weights(B_full, None)
+        # Set B weights (B tile is already [rank, x_size], no expansion needed)
+        self.tile_b.set_weights(B_lr, None)
         
     def get_x_size(self) -> int:
         """Get input size."""

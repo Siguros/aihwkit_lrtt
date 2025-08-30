@@ -41,7 +41,7 @@ class LRTTController:
     def __init__(
         self,
         tile_a: AnalogTileWithoutPeriphery,   # fastA [d_size, rank]
-        tile_b: AnalogTileWithoutPeriphery,   # fastB [rank, x_size]  
+        tile_b: AnalogTileWithoutPeriphery,   # fastB [rank, x_size] 
         tile_c: AnalogTileWithoutPeriphery,   # visible [d_size, x_size]
         d_size: int,
         x_size: int,
@@ -175,22 +175,19 @@ class LRTTController:
         A_zeros = torch.zeros(self.d_size, self.rank, device=self.device, dtype=self.dtype)
         self.tile_a.set_weights(A_zeros)
         
-        # B matrix: zero full, then Kaiming for first rank rows
-        B_full = torch.zeros(self.d_size, self.x_size, device=self.device, dtype=self.dtype)
-        
+        # B matrix: [rank, x_size] - Kaiming Normal initialization
         # Kaiming Normal: std = gain * sqrt(2 / fan_in), fan_in = x_size
         std = self.reinit_gain * math.sqrt(2.0 / self.x_size)
         B_kaiming = torch.normal(0, std, size=(self.rank, self.x_size), device=self.device, dtype=self.dtype)
-        B_full[:self.rank, :] = B_kaiming
         
-        self.tile_b.set_weights(B_full)
+        self.tile_b.set_weights(B_kaiming)
         
         # Apply device clipping if available
         if hasattr(self.tile_b, 'clip_weights'):
             self.tile_b.clip_weights()
             
         # Visible (C): small init if forward_inject enabled and C is zero
-        if self.forward_inject:
+        if self.forward_inject_enabled:
             C_weights = self.tile_c.get_weights()[0]
             if torch.norm(C_weights) < 1e-6:
                 # Small Kaiming init to avoid degenerate W_eff
@@ -214,9 +211,9 @@ class LRTTController:
         Given x ∈ ℝ^{x_size×m}, d ∈ ℝ^{d_size×m}:
         1. Pack A_lr = A[:, :rank], B_lr = B[:rank, :]  
         2. Compute projections: X_B = B_lr @ x, D_A = A_lr^T @ d
-        3. Route to tiles with padded buffers:
-           - A update: inputs = pad_rows(X_B, rank → d_size), errors = d
-           - B update: inputs = x, errors = pad_rows(D_A, rank → d_size)
+        3. Route to tiles with proper rank-constrained updates:
+           - A update: inputs = X_B, errors = d
+           - B update: only update first rank rows with gradient from D_A
         4. Apply BL management and gradient magnitude correction
         
         Args:
@@ -244,30 +241,41 @@ class LRTTController:
         batch_size = x.size(-1)
         self._ensure_buffers(batch_size)
         
-        # Get current A_lr and B_lr weights
-        A_full = self.tile_a.get_weights()[0].to(x.device)  # [d_size, rank]  
-        B_full = self.tile_b.get_weights()[0].to(x.device)  # [d_size, x_size]
+        # Prepare batch-first views for tile operations
+        x_bf = x.t()  # [batch, x_size]
+        d_bf = d.t()  # [batch, d_size]
         
-        A_lr = A_full[:, :self.rank]           # [d_size, rank]
-        B_lr = B_full[:self.rank, :]           # [rank, x_size]
-        
-        # Compute LoRA projections
-        # X_B = B_lr @ x: [rank, x_size] @ [x_size, m] -> [rank, m]
-        X_B = B_lr @ x
-        # D_A = A_lr^T @ d: [rank, d_size] @ [d_size, m] -> [rank, m]  
-        D_A = A_lr.t() @ d
-        
-        # Apply gradient magnitude correction
-        if self.correct_gradient_magnitudes:
-            correction = math.sqrt(self.rank)
-            lr = lr * correction
+        # Compute LoRA projections using tile forward/backward (no get_weights!)
+        with torch.no_grad():
+            # X_B = B_lr @ x -> Use B tile forward (B is now [rank, x_size])
+            X_B = self.tile_b.forward(x_bf).t()  # [batch, rank] -> [rank, batch]
             
-        # Update A tile: inputs = X_B (already rank-sized), errors = d
+            # D_A = A_lr^T @ d -> Use A tile backward if available
+            if hasattr(self.tile_a, 'backward'):
+                # A.backward gives gradient w.r.t. input: [batch, rank]
+                D_A = self.tile_a.backward(d_bf).t()  # [rank, batch]
+            else:
+                # Fallback: read weights (only if backward not available)
+                A_full = self.tile_a.get_weights()[0].to(x.device)  # [d_size, rank]
+                D_A = A_full[:, :self.rank].t() @ d  # [rank, d_size] @ [d_size, batch] -> [rank, batch]
+        
+        # Apply LoRA alpha scaling and gradient magnitude correction
+        # Critical: LoRA gradients need to be scaled by alpha
+        lr_eff = lr * self.lora_alpha
+        
+        # Apply gradient magnitude correction (optional)
+        if self.correct_gradient_magnitudes:
+            # Use 1/sqrt(rank) for proper scaling (not sqrt(rank))
+            lr_eff = lr_eff / math.sqrt(self.rank)
+            
+        # Update A tile: inputs = X_B, errors = d
         # A tile is [d_size, rank] and expects inputs [batch, rank]
+        # NOTE: In CUDA, X_B is padded to [x_size, batch] but for Python tiles
+        # we use X_B directly as [batch, rank] since tiles handle dimensions differently
         
         # Apply BL management for A update
         old_lr = self.tile_a.get_learning_rate() 
-        self.tile_a.set_learning_rate(lr)
+        self.tile_a.set_learning_rate(lr_eff)
         
         # Force StochasticCompressed pulse type if BL management specified
         if self.ab_bl_mgmt:
@@ -277,28 +285,32 @@ class LRTTController:
         # Tiles expect [batch, features] format
         # X_B is [rank, batch], transpose to [batch, rank]
         # d is [d_size, batch], transpose to [batch, d_size]
-        self.tile_a.update(X_B.t(), d.t())
+        # Use original update if available (to avoid hook recursion)
+        if hasattr(self.tile_a, '_orig_update'):
+            self.tile_a._orig_update(X_B.t(), d.t())
+        else:
+            self.tile_a.update(X_B.t(), d.t())
         self.tile_a.set_learning_rate(old_lr)
         self.num_a_updates += 1
         
-        # Update B tile: inputs = x, errors = D_A (padded to d_size)
-        # B tile is [d_size, x_size] but only first rank rows are used
-        # We need to pad D_A from [rank, batch] to [d_size, batch]
-        d_padded = torch.zeros(self.d_size, batch_size, device=x.device, dtype=x.dtype)
-        d_padded[:self.rank, :] = D_A  # Pad D_A to [d_size, batch]
+        # Update B tile: inputs = x, errors = D_A 
+        # B tile is now [rank, x_size], so no padding needed
         
-        old_lr = self.tile_b.get_learning_rate()
-        self.tile_b.set_learning_rate(lr)
+        old_lr_b = self.tile_b.get_learning_rate()
+        self.tile_b.set_learning_rate(lr_eff)
         
         if self.ab_bl_mgmt:
             # Apply ab_bl_mgmt settings
             pass
             
         # Tiles expect [batch, features] format
-        # x is [x_size, batch], transpose to [batch, x_size]
-        # d_padded is [d_size, batch], transpose to [batch, d_size]
-        self.tile_b.update(x.t(), d_padded.t())
-        self.tile_b.set_learning_rate(old_lr)
+        # B tile is [rank, x_size], expects inputs [batch, x_size] and errors [batch, rank]
+        # Use original update if available (to avoid hook recursion)
+        if hasattr(self.tile_b, '_orig_update'):
+            self.tile_b._orig_update(x.t(), D_A.t())  # x.t() = [batch, x_size], D_A.t() = [batch, rank]
+        else:
+            self.tile_b.update(x.t(), D_A.t())
+        self.tile_b.set_learning_rate(old_lr_b)
         self.num_b_updates += 1
         
         # Update counters
@@ -317,12 +329,12 @@ class LRTTController:
         4. Apply transfer BL management
         5. Unconditionally call reinit() after transfer
         """
-        # Get current A and B weights  
-        A_full = self.tile_a.get_weights()[0]  # [d_size, rank]
-        B_full = self.tile_b.get_weights()[0]  # [d_size, x_size] 
+        # Get current A and B weights and ensure they're on the right device
+        device = self._get_tile_device()
+        A_full = self.tile_a.get_weights()[0].to(device)  # [d_size, rank]
+        B_lr = self.tile_b.get_weights()[0].to(device)  # [rank, x_size] - B is already rank-sized
         
         A_lr = A_full[:, :self.rank]           # [d_size, rank]
-        B_lr = B_full[:self.rank, :]           # [rank, x_size]
         
         # Transfer in chunks to manage memory
         lr_eff = abs(self.transfer_lr)
@@ -342,7 +354,6 @@ class LRTTController:
             # Pack chunks
             D_chunk = A_lr[:, off:end]              # [d_size, cur]
             X_chunk = B_lr[off:end, :]              # [cur, x_size]
-            X_chunk_T = X_chunk.t()                 # [x_size, cur] for PWU
             
             # Sign rule: PWU computes W += -lr * D @ X^T, we want W += +transfer_lr * D @ X^T
             # So when transfer_lr > 0, negate D to get correct sign
@@ -354,7 +365,16 @@ class LRTTController:
                 pass
                 
             # Pulsed update: C += transfer_lr * D_chunk @ X_chunk  
-            self.tile_c.update(X_chunk_T, D_chunk, bias=False)
+            # Use original update to avoid hook recursion
+            # Tiles expect [batch, features] format: X_chunk is [cur, x_size], D_chunk.T is [cur, d_size]
+            # Ensure tensors are on CPU for analog tiles
+            X_chunk_cpu = X_chunk.cpu() if X_chunk.is_cuda else X_chunk
+            D_chunk_t_cpu = D_chunk.t().cpu() if D_chunk.is_cuda else D_chunk.t()
+            
+            if hasattr(self.tile_c, '_orig_update'):
+                self.tile_c._orig_update(X_chunk_cpu, D_chunk_t_cpu)
+            else:
+                self.tile_c.update(X_chunk_cpu, D_chunk_t_cpu)
             
         self.tile_c.set_learning_rate(old_lr)
         self.num_transfers += 1
@@ -388,7 +408,7 @@ class LRTTController:
         """
         # Handle disabled forward injection
         if not self.forward_inject_enabled or self.rank == 0:
-            return self.tile_c.forward(x, bias=False, in_trans=in_trans, out_trans=out_trans)
+            return self.tile_c.forward(x, in_trans=in_trans, out_trans=out_trans)
             
         # Handle transposed cases with digital fallback
         if out_trans or in_trans:
@@ -406,11 +426,8 @@ class LRTTController:
         """Digital fallback: compose W_eff then single forward pass."""
         # Get weights
         C_weights = self.tile_c.get_weights()[0]   # [d_size, x_size]
-        A_full = self.tile_a.get_weights()[0]      # [d_size, rank]
-        B_full = self.tile_b.get_weights()[0]      # [d_size, x_size]
-        
-        A_lr = A_full[:, :self.rank]               # [d_size, rank] 
-        B_lr = B_full[:self.rank, :]               # [rank, x_size]
+        A_lr = self.tile_a.get_weights()[0]        # [d_size, rank]
+        B_lr = self.tile_b.get_weights()[0]        # [rank, x_size]
         
         # Compose effective weights: W_eff = C + α * A_lr @ B_lr
         W_eff = C_weights + self.lora_alpha * (A_lr @ B_lr)
@@ -435,9 +452,8 @@ class LRTTController:
         # 1. Visible forward: y_vis = C·x
         y_vis = self.tile_c.forward(x)  # [batch, d_size]
         
-        # 2. B forward: g_full = B·x, take first rank outputs
-        g_full = self.tile_b.forward(x)  # [batch, d_size] since B is [d_size, x_size]
-        g_rank = g_full[:, :self.rank]   # [batch, rank] - take first rank columns
+        # 2. B forward: g = B·x  
+        g_rank = self.tile_b.forward(x)  # [batch, rank] since B is [rank, x_size]
         
         # 3. A forward with g_rank directly
         # A tile is [d_size, rank] internally (only uses first rank cols)
@@ -474,11 +490,15 @@ class LRTTController:
             'units_in_mbatch': self.units_in_mbatch,
             'lora_alpha': self.lora_alpha,
             'reinit_gain': self.reinit_gain,
-            'forward_inject': self.forward_inject
+            'forward_inject_enabled': self.forward_inject_enabled
         }
         
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         """Load controller state from serialization."""
+        # Handle backward compatibility for old 'forward_inject' key
+        if 'forward_inject' in state_dict and 'forward_inject_enabled' not in state_dict:
+            state_dict['forward_inject_enabled'] = state_dict.pop('forward_inject')
+            
         for key, value in state_dict.items():
             if hasattr(self, key):
                 setattr(self, key, value)
