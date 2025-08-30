@@ -49,13 +49,13 @@ HIDDEN_SIZES = [256, 128]
 OUTPUT_SIZE = 10
 
 # Training parameters.
-EPOCHS = 30
+EPOCHS = 50
 BATCH_SIZE = 64
 
 # LRTT parameters - using different ranks for different layer sizes
-LRTT_RANKS = [16, 16]  # Ranks for LRTT layers (input->hidden1, hidden1->hidden2)
-TRANSFER_EVERY = 100 #fer A⊗B to C every N updates
-LORA_ALPHA = 8.0 #LoRA scaling factor - reduced from 100.0 for stability
+LRTT_RANKS = [1, 1]  # Ranks for LRTT layers (input->hidden1, hidden1->hidden2)
+TRANSFER_EVERY = 2 #fer A⊗B to C every N updates
+LORA_ALPHA = 16 #LoRA scaling factor - reduced from 100.0 for stability
 
 
 def load_images():
@@ -108,7 +108,7 @@ def create_analog_network_lrtt(input_size, hidden_sizes, output_size):
     Returns:
         nn.Module: created analog model with LRTT
     """
-    print(f"Creating LRTT network with ranks: {LRTT_RANKS} (final layer uses FloatingPoint)")
+    print(f"Creating LRTT network with ranks: {LRTT_RANKS} (final layer uses IdealizedPreset)")
     
     model = AnalogSequential(
         # Layer 1: 784 -> 256 with rank 32
@@ -395,8 +395,13 @@ def test_evaluation(model, val_set):
 
 def save_results_to_excel(results, final_test_accuracy):
     """Save training results to Excel file with parameter-based filename."""
+    # Create results directory if it doesn't exist
+    results_dir = "results"
+    os.makedirs(results_dir, exist_ok=True)
+    
     # Create filename based on parameters
     filename = f"mnist_lrtt_results_te{TRANSFER_EVERY}_r{LRTT_RANKS[0]}_{LRTT_RANKS[1]}_a{LORA_ALPHA:.1f}.xlsx"
+    filepath = os.path.join(results_dir, filename)
     
     # Convert results to DataFrame
     df = pd.DataFrame(results)
@@ -412,12 +417,12 @@ def save_results_to_excel(results, final_test_accuracy):
     params_df = pd.DataFrame(params_info)
     
     # Save to Excel with multiple sheets
-    with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+    with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
         df.to_excel(writer, sheet_name='Training_Results', index=False)
         params_df.to_excel(writer, sheet_name='Parameters', index=False)
     
-    print(f"\nResults saved to: {filename}")
-    return filename
+    print(f"\nResults saved to: {filepath}")
+    return filepath
 
 
 def main():
