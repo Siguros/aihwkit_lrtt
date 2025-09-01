@@ -19,7 +19,7 @@ from datetime import datetime
 import json
 
 # Experiment parameters
-TRANSFER_EVERY_VALUES = [2, 10, 100, 1000, 100000]
+TRANSFER_EVERY_VALUES = [100, 1000]
 LRTT_RANKS_VALUES = [[1, 1], [4, 4], [8, 8], [16, 16], [32, 32]]
 LORA_ALPHA_VALUES = [1, 4, 8, 16, 32]
 

@@ -43,12 +43,16 @@ class LRTTSimulatorTile(SimulatorTile, Module):
     - Full scheduling and BL management support
     """
     
+    supports_indexed: bool = False
+    
     def __init__(
         self, 
         d_size: int,  # out_features from AnalogLinear
         x_size: int,  # in_features from AnalogLinear 
         rpu_config: UnitCellRPUConfig, 
-        dtype: RPUDataType
+        bias: bool = False,  # Added for compatibility
+        dtype: Optional[RPUDataType] = None,  # Optional, get from config if not provided
+        **kwargs  # Ignore extra kwargs for compatibility
     ):
         """Initialize LRTT simulator tile.
         
@@ -57,12 +61,18 @@ class LRTTSimulatorTile(SimulatorTile, Module):
             x_size: Input size (in_features from AnalogLinear)
             rpu_config: Must contain LRTTTransferCompound device
             dtype: Data type for tiles
+            bias: Whether to use bias (currently not supported in LRTT)
         """
         Module.__init__(self)
         
         self.x_size = x_size
         self.d_size = d_size
+        # Get dtype from config if not provided
+        if dtype is None:
+            from aihwkit.simulator.parameters.enums import RPUDataType
+            dtype = RPUDataType.FLOAT  # Default to float32
         self.dtype = dtype
+        self.bias = bias  # Store but don't use for now
         
         # Validate configuration - check for PythonLRTTDevice
         from aihwkit.simulator.configs.lrtt_python import PythonLRTTDevice
@@ -198,6 +208,22 @@ class LRTTSimulatorTile(SimulatorTile, Module):
     def _reset_update_flag(self) -> None:
         """Reset the update handled flag for next batch."""
         self._update_handled = False
+    
+    def get_tensor_view(self, ndim: int, dim: Optional[int] = None) -> tuple:
+        """Return the tensor view for ndim vector at dim.
+        
+        Args:
+            ndim: number of dimensions
+            dim: the dimension to set to -1
+            
+        Returns:
+            Tuple of ones with the `dim` index sets to -1
+        """
+        if dim is None:
+            dim = 0 if getattr(self, 'out_trans', False) else ndim - 1
+        tensor_view = [1] * ndim
+        tensor_view[dim] = -1
+        return tuple(tensor_view)
         
     def forward(
         self,
@@ -207,6 +233,7 @@ class LRTTSimulatorTile(SimulatorTile, Module):
         out_trans: bool = False,
         is_test: bool = False,
         non_blocking: bool = False,
+        tensor_view: Optional[Tuple] = None,  # Added for array compatibility
     ) -> Tensor:
         """Forward pass with LRTT forward injection.
         
@@ -476,3 +503,62 @@ class LRTTSimulatorTile(SimulatorTile, Module):
     def manual_transfer(self) -> None:
         """Manually trigger A⊗B -> visible transfer (for testing)."""
         self.controller.ab_weight_transfer()
+    
+    def _infer_device_from_self(self) -> torch.device:
+        """Infer device from submodule parameters/buffers."""
+        # Check parameters
+        for p in self.parameters(recurse=True):
+            return p.device
+        # Check buffers
+        for b in self.buffers(recurse=True):
+            return b.device
+        # Default to CUDA if available
+        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    def to(self, *args, **kwargs):
+        """Move to device and synchronize controller."""
+        super().to(*args, **kwargs)
+        
+        # Extract device from arguments
+        device = kwargs.get('device', None)
+        if device is None and len(args) > 0:
+            if isinstance(args[0], torch.device):
+                device = args[0]
+            elif isinstance(args[0], str):
+                device = torch.device(args[0])
+        
+        # If still no device, infer from self
+        if device is None:
+            device = self._infer_device_from_self()
+        
+        # Synchronize controller device
+        if hasattr(self, 'controller'):
+            self.controller.set_device(device)
+            
+        return self
+    
+    def cuda(self, device=None):
+        """Move to CUDA and synchronize controller."""
+        super().cuda(device=device)
+        
+        # Determine CUDA device
+        if device is None:
+            cuda_device = torch.device('cuda')
+        else:
+            cuda_device = torch.device(f'cuda:{device}')
+        
+        # Synchronize controller
+        if hasattr(self, 'controller'):
+            self.controller.set_device(cuda_device)
+            
+        return self
+    
+    def cpu(self):
+        """Move to CPU and synchronize controller."""
+        super().cpu()
+        
+        # Synchronize controller
+        if hasattr(self, 'controller'):
+            self.controller.set_device(torch.device('cpu'))
+            
+        return self

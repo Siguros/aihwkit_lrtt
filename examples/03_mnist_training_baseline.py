@@ -145,7 +145,7 @@ def create_sgd_optimizer(model):
     Returns:
         nn.Module: optimizer
     """
-    optimizer = AnalogSGD(model.parameters(), lr=0.1)  # Same LR as LRTT version
+    optimizer = AnalogSGD(model.parameters(), lr=0.001)  # Same LR as LRTT version
     optimizer.regroup_param_groups(model)
 
     return optimizer

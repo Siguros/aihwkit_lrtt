@@ -16,10 +16,12 @@ import os
 from datetime import datetime
 
 # Imports from PyTorch.
+import torch
 from torch import nn, Tensor, device, no_grad, manual_seed, save
 from torch import max as torch_max
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
 
 from torchvision import datasets, transforms
 
@@ -51,15 +53,16 @@ WEIGHT_PATH = os.path.join(RESULTS, "example_18_lrtt_model_weight.pth")
 # Training parameters
 SEED = 1
 N_EPOCHS = 100  # Reduced for LRTT demonstration
-BATCH_SIZE = 32
+BATCH_SIZE = 128  # Increased for better GPU utilization
 LEARNING_RATE = 0.1
 N_CLASSES = 10
+NUM_WORKERS = 4  # For faster data loading
 
 # LRTT configuration parameters
 LRTT_RANK_CONV = 8  # Rank for convolutional layers
 LRTT_RANK_FC = 16  # Rank for fully connected layers
-TRANSFER_EVERY = 200  # Transfer A⊗B to C every N updates
-LORA_ALPHA = 1.0  # LoRA scaling factor
+TRANSFER_EVERY = 10000  # Transfer A⊗B to C more frequently for better convergence
+LORA_ALPHA = 1  # LoRA scaling factor
 
 
 def create_lrtt_config_conv():
@@ -71,9 +74,7 @@ def create_lrtt_config_conv():
     device_config = PythonLRTTPreset.idealized(
         rank=LRTT_RANK_CONV,
         transfer_every=TRANSFER_EVERY,
-        lora_alpha=LORA_ALPHA,
-        forward_inject=True,
-        correct_gradient_magnitudes=True
+        lora_alpha=LORA_ALPHA
     )
     device_config.transfer_lr = device_config.lora_alpha
     
@@ -227,8 +228,10 @@ def load_images():
     transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
     train_set = datasets.CIFAR10(PATH_DATASET, download=True, train=True, transform=transform)
     val_set = datasets.CIFAR10(PATH_DATASET, download=True, train=False, transform=transform)
-    train_data = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
-    validation_data = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False)
+    train_data = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, 
+                          num_workers=NUM_WORKERS, pin_memory=True if USE_CUDA else False)
+    validation_data = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False,
+                               num_workers=NUM_WORKERS, pin_memory=True if USE_CUDA else False)
 
     return train_data, validation_data
 
@@ -328,7 +331,7 @@ def print_lrtt_statistics(model, epoch):
         model (nn.Module): Model with LRTT layers
         epoch (int): Current epoch number
     """
-    if epoch % 10 == 0:  # Print every 10 epochs
+    if epoch % 1 == 0:  # Print every 10 epochs
         print(f"\nLRTT Statistics at epoch {epoch}:")
         
         # Count LRTT layers and get statistics
@@ -365,9 +368,10 @@ def main():
 
     print(f"Model moved to {DEVICE}")
     
-    # Count parameters
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total parameters: {total_params:,}")
+    # Count parameters - analog tiles don't register weights as PyTorch parameters
+    pytorch_params = sum(p.numel() for p in model.parameters())
+    print(f"PyTorch registered parameters: {pytorch_params:,}")
+    print("Note: Analog tile weights are stored internally in C++ and not counted here")
 
     # Define the loss function and optimizer
     criterion = nn.CrossEntropyLoss()
@@ -399,7 +403,7 @@ def main():
             save(model.state_dict(), WEIGHT_PATH)
 
         # Print progress
-        if (epoch + 1) % 5 == 0:
+        if (epoch + 1) % 1 == 0:
             print(f"Epoch {epoch + 1:3d}: "
                   f"Train Loss {train_loss:.4f}, "
                   f"Val Loss {val_loss:.4f}, "

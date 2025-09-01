@@ -53,9 +53,9 @@ EPOCHS = 50
 BATCH_SIZE = 64
 
 # LRTT parameters - using different ranks for different layer sizes
-LRTT_RANKS = [1, 1]  # Ranks for LRTT layers (input->hidden1, hidden1->hidden2)
-TRANSFER_EVERY = 2 #fer A⊗B to C every N updates
-LORA_ALPHA = 16 #LoRA scaling factor - reduced from 100.0 for stability
+LRTT_RANKS = [32, 32]  # Ranks for LRTT layers (input->hidden1, hidden1->hidden2)
+TRANSFER_EVERY = 1000 #fer A⊗B to C every N updates
+LORA_ALPHA = 32 #LoRA scaling factor - reduced from 100.0 for stability
 
 
 def load_images():
